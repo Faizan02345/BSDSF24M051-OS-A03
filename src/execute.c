@@ -1,4 +1,3 @@
-
 #include "shell.h"
 
 #include <fcntl.h>
@@ -8,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 #define MAX_JOBS 20
 
@@ -19,8 +19,162 @@ typedef struct {
     int active;
 } Job;
 
+
 static Job job_list[MAX_JOBS];
 static int next_job_id = 1;
+
+/* Shell-local variables */
+#define MAX_VARIABLES 50
+
+typedef struct {
+    char name[ARGLEN];
+    char value[MAX_LEN];
+} ShellVariable;
+
+static ShellVariable variables[MAX_VARIABLES];
+static int variable_count = 0;
+
+static int valid_variable_name(const char *name, size_t length) {
+    if (length == 0 || length >= ARGLEN) {
+        return 0;
+    }
+
+    if (!(isalpha((unsigned char)name[0]) || name[0] == '_')) {
+        return 0;
+    }
+
+    for (size_t i = 1; i < length; i++) {
+        if (!(isalnum((unsigned char)name[i]) || name[i] == '_')) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+static int find_variable(const char *name) {
+    for (int i = 0; i < variable_count; i++) {
+        if (strcmp(variables[i].name, name) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void set_variable(const char *name, const char *value) {
+    int index = find_variable(name);
+
+    if (index == -1) {
+        if (variable_count >= MAX_VARIABLES) {
+            fprintf(stderr, "Variable table is full.\n");
+            return;
+        }
+        index = variable_count++;
+        snprintf(variables[index].name,
+                 sizeof(variables[index].name), "%s", name);
+    }
+
+    snprintf(variables[index].value,
+             sizeof(variables[index].value), "%s", value);
+}
+
+static int handle_assignment(char **arglist) {
+    if (arglist[0] == NULL || arglist[1] != NULL) {
+        return 0;
+    }
+
+    char *equals = strchr(arglist[0], '=');
+    if (equals == NULL) {
+        return 0;
+    }
+
+    size_t name_length = (size_t)(equals - arglist[0]);
+    if (!valid_variable_name(arglist[0], name_length)) {
+        return 0;
+    }
+
+    char name[ARGLEN];
+    memcpy(name, arglist[0], name_length);
+    name[name_length] = '\0';
+
+    set_variable(name, equals + 1);
+    return 1;
+}
+
+static const char *get_variable_value(const char *name) {
+    int index = find_variable(name);
+    return index >= 0 ? variables[index].value : "";
+}
+
+/* Expand $NAME and ${NAME} in each argument before command execution. */
+static void expand_one_argument(const char *source,
+                                char *destination, size_t capacity) {
+    size_t out = 0;
+
+    for (size_t i = 0; source[i] != '\0' && out + 1 < capacity;) {
+        if (source[i] != '$') {
+            destination[out++] = source[i++];
+            continue;
+        }
+
+        size_t name_start;
+        size_t name_end;
+        int braced = 0;
+
+        if (source[i + 1] == '{') {
+            braced = 1;
+            name_start = i + 2;
+            name_end = name_start;
+            while (source[name_end] != '\0' && source[name_end] != '}') {
+                name_end++;
+            }
+            if (source[name_end] != '}') {
+                destination[out++] = source[i++];
+                continue;
+            }
+        } else {
+            name_start = i + 1;
+            name_end = name_start;
+            while (isalnum((unsigned char)source[name_end]) ||
+                   source[name_end] == '_') {
+                name_end++;
+            }
+            if (name_end == name_start) {
+                destination[out++] = source[i++];
+                continue;
+            }
+        }
+
+        size_t name_length = name_end - name_start;
+        if (name_length > 0 && name_length < ARGLEN) {
+            char name[ARGLEN];
+            memcpy(name, source + name_start, name_length);
+            name[name_length] = '\0';
+
+            const char *value = get_variable_value(name);
+            while (*value != '\0' && out + 1 < capacity) {
+                destination[out++] = *value++;
+            }
+        }
+
+        i = braced ? name_end + 1 : name_end;
+    }
+
+    destination[out] = '\0';
+}
+
+static void expand_arguments(char **source, char **destination,
+                             char storage[MAXARGS][MAX_LEN]) {
+    int i = 0;
+
+    while (source[i] != NULL && i < MAXARGS) {
+        expand_one_argument(source[i], storage[i], MAX_LEN);
+        destination[i] = storage[i];
+        i++;
+    }
+
+    destination[i] = NULL;
+}
 
 static void reap_background_jobs(void);
 static void show_jobs(void);
@@ -173,6 +327,8 @@ static int execute_builtin(char **arglist) {
         printf("  help     - Display help information\n");
         printf("  jobs     - Display background jobs\n");
         printf("  history  - Display command history\n");
+        printf("  set      - Display shell variables\n");
+        printf("  NAME=value - Create or update a shell variable\n");
         printf("  ;        - Execute commands sequentially\n");
         printf("  &        - Execute command in background\n\n");
 
@@ -186,6 +342,14 @@ static int execute_builtin(char **arglist) {
 
     if (strcmp(arglist[0], "history") == 0) {
         show_history();
+        return 0;
+    }
+
+    if (strcmp(arglist[0], "set") == 0) {
+        for (int i = 0; i < variable_count; i++) {
+            printf("%s=%s\n",
+                   variables[i].name, variables[i].value);
+        }
         return 0;
     }
 
@@ -428,6 +592,11 @@ static int execute_single(char **arglist, int background,
         return execute_pipeline(arglist, background, command);
     }
 
+    /* Variable assignments must run in the shell process, not a child. */
+    if (handle_assignment(arglist)) {
+        return 0;
+    }
+
     if (!background) {
         int result = execute_builtin(arglist);
 
@@ -525,7 +694,14 @@ int execute(char **arglist) {
             arglist[i] = NULL;
 
             if (start < i) {
-                status = execute_single(&arglist[start],
+                char expanded_storage[MAXARGS][MAX_LEN];
+                char *expanded_args[MAXARGS + 1];
+
+                expand_arguments(&arglist[start],
+                                 expanded_args,
+                                 expanded_storage);
+
+                status = execute_single(expanded_args,
                                         background,
                                         command);
             }
@@ -543,3 +719,4 @@ int execute(char **arglist) {
 
     return status;
 }
+
